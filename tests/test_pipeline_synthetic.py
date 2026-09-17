@@ -609,6 +609,60 @@ def test_trimming_config_pairs_features_with_past_tr_only(truth):
     assert TRIMMING_CONFIG["test_features_end"] == -BRAIN_TRIM_TAIL
 
 
+def test_determinism(pipeline_data, monkeypatch):
+    """The same seed reproduces the correlation vector; a different fold seed does not.
+
+    The second half is what stops this passing vacuously. Note it has to compare the
+    *correlation arrays*: changing the fold seed reshuffles which alpha each voxel
+    gets, but on this fixture it moves the median by only ~5e-6 and leaves
+    n_significant unchanged, so asserting on either of those would pass no matter
+    what the pipeline did.
+
+    ``fit_predict`` exposes no seed argument -- ``_find_best_alphas`` calls
+    ``create_folds`` without one, so the fold seed is always the default 0. The
+    alternate seed is injected by patching that call site.
+    """
+    data = pipeline_data["data"]
+    model = pipeline_data["trainer"].model
+
+    def fit():
+        metrics, _, alphas = model.fit_predict(
+            features=data["Rstim"],
+            targets=data["Rresp"],
+            X_test=data["Pstim"],
+            y_test=data["Presp"],
+            **MODEL_KWARGS,
+        )
+        return np.asarray(metrics["correlations"]), np.asarray(alphas)
+
+    first, first_alphas = fit()
+    second, second_alphas = fit()
+
+    # Same seed, same everything: reproducible.
+    assert np.allclose(first, second, rtol=0, atol=1e-12)
+    np.testing.assert_array_equal(first_alphas, second_alphas)
+
+    # Different fold seed: a genuinely different model.
+    import encoding.models.nested_cv as nested_cv_mod
+    from encoding.models.folding import create_folds as real_create_folds
+
+    def seeded_create_folds(n_samples, fold_type, n_folds, chunk_length=None,
+                            trim_size=None, groups=None, seed=0):
+        return real_create_folds(
+            n_samples, fold_type, n_folds, chunk_length, trim_size, groups, seed=7
+        )
+
+    monkeypatch.setattr(nested_cv_mod, "create_folds", seeded_create_folds)
+    other, other_alphas = fit()
+
+    assert not np.allclose(first, other, rtol=0, atol=1e-12), (
+        "changing the inner-CV fold seed produced an identical correlation vector, "
+        "which means the seed is not reaching create_folds and the first half of "
+        "this test proves nothing"
+    )
+    assert (first_alphas != other_alphas).any(), "no voxel changed its selected alpha"
+
+
 def test_fixture_is_deterministic():
     """Same seed, same assembly -- so a failure is reproducible."""
     a = synthetic_assembly(n_stories=2, n_trs=(60, 60), n_vertices=64, seed=3)
