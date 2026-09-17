@@ -12,6 +12,7 @@ def create_folds(
     chunk_length: Optional[int] = None,
     trim_size: Optional[int] = None,
     groups: Optional[np.ndarray] = None,
+    seed: int = 0,
 ) -> List[Tuple[List[int], List[int]]]:
     """Create train/test indices according to the specified folding strategy
 
@@ -24,6 +25,7 @@ def create_folds(
         trim_size: Number of TRs to trim from beginning and end of test folds/chunks
                   (used for 'chunked_trimmed' and 'kfold_trimmed' fold types)
         groups: Group labels for group-based folding
+        seed: Random seed for chunk shuffling, for reproducible folds
 
     Returns:
         List of (train_indices, test_indices) tuples
@@ -31,17 +33,21 @@ def create_folds(
     print(f"THIS IS THE FOLDING TYPE: {fold_type} inside folding.py")
     if fold_type == "chunked":
         # Current chunked implementation with random shuffling
-        return create_chunked_folds(n_samples, n_folds, chunk_length, shuffle=True)
+        return create_chunked_folds(
+            n_samples, n_folds, chunk_length, shuffle=True, seed=seed
+        )
     elif fold_type == "chunked_trimmed":
         # Chunked with trimmed test chunks to reduce autocorrelation
         if trim_size is None:
             trim_size = 5  # Default trim size of 5 TRs
         return create_chunked_folds_trimmed(
-            n_samples, n_folds, chunk_length, trim_size, shuffle=True
+            n_samples, n_folds, chunk_length, trim_size, shuffle=True, seed=seed
         )
     elif fold_type == "chunked_contiguous":
         # Chunked but maintaining original order
-        return create_chunked_folds(n_samples, n_folds, chunk_length, shuffle=False)
+        return create_chunked_folds(
+            n_samples, n_folds, chunk_length, shuffle=False, seed=seed
+        )
     elif fold_type == "kfold":
         # Regular KFold with shuffle=False for contiguity
         kf = KFold(n_splits=n_folds, shuffle=False)
@@ -65,7 +71,11 @@ def create_folds(
 
 
 def create_chunked_folds(
-    n_samples: int, n_folds: int, chunk_length: int, shuffle: bool = True
+    n_samples: int,
+    n_folds: int,
+    chunk_length: int,
+    shuffle: bool = True,
+    seed: int = 0,
 ) -> List[Tuple[List[int], List[int]]]:
     """Create KFold splits that respect chunk structure of fMRI data.
 
@@ -74,6 +84,7 @@ def create_chunked_folds(
         n_folds: Number of folds to create
         chunk_length: Length of chunks
         shuffle: Whether to shuffle chunks or keep them in original order
+        seed: Random seed for chunk shuffling, for reproducible folds
 
     Returns:
         List of (train_indices, test_indices) tuples
@@ -83,7 +94,7 @@ def create_chunked_folds(
     chunk_indices = list(range(n_complete_chunks))
 
     if shuffle:
-        random.shuffle(chunk_indices)
+        random.Random(seed).shuffle(chunk_indices)
 
     # Divide chunks evenly into n_folds
     chunks_per_fold = n_complete_chunks // n_folds
@@ -92,7 +103,9 @@ def create_chunked_folds(
         logging.warning(
             "Not enough chunks for the requested folds, falling back to regular KFold"
         )
-        kf = KFold(n_splits=n_folds, shuffle=shuffle)
+        kf = KFold(
+            n_splits=n_folds, shuffle=shuffle, random_state=seed if shuffle else None
+        )
         return list(kf.split(range(n_samples)))
 
     # Create exactly n_folds splits
@@ -130,6 +143,7 @@ def create_chunked_folds_trimmed(
     chunk_length: int,
     trim_size: int = 5,
     shuffle: bool = True,
+    seed: int = 0,
 ) -> List[Tuple[List[int], List[int]]]:
     """Create KFold splits with trimmed test chunks to reduce autocorrelation effects.
 
@@ -144,6 +158,7 @@ def create_chunked_folds_trimmed(
         chunk_length: Length of chunks
         trim_size: Number of time points to trim from beginning and end of test chunks
         shuffle: Whether to shuffle chunks or keep them in original order
+        seed: Random seed for chunk shuffling, for reproducible folds
 
     Returns:
         List of (train_indices, test_indices) tuples
@@ -153,7 +168,7 @@ def create_chunked_folds_trimmed(
     chunk_indices = list(range(n_complete_chunks))
 
     if shuffle:
-        random.shuffle(chunk_indices)
+        random.Random(seed).shuffle(chunk_indices)
 
     # Divide chunks evenly into n_folds
     chunks_per_fold = n_complete_chunks // n_folds
