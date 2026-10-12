@@ -166,8 +166,13 @@ def test_legacy_downsamplers_return_one_row_per_tr(assembly, truth, method):
     assert out.shape[0] == len(sd.split_indices) + 1
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="non-legacy downsamplers read split_indices as per-word TR labels "
+    "and return ~n_words rows",
+)
 @pytest.mark.parametrize("method", ["average", "sum", "last"])
-def test_nonlegacy_downsamplers_misread_split_indices(assembly, truth, method):
+def test_nonlegacy_downsamplers_return_one_row_per_tr(assembly, truth, method):
     """Known bug: non-legacy methods read split_indices as per-word TR labels and
     return max(split_indices) + 1 rows (~n_words) instead of n_trs."""
     ds = Downsampler()
@@ -182,9 +187,7 @@ def test_nonlegacy_downsamplers_misread_split_indices(assembly, truth, method):
         method=method,
         split_indices=sd.split_indices,
     )
-    assert out.shape[0] == max(sd.split_indices) + 1
-    assert out.shape[0] != st.n_trs
-    assert out.shape[0] > st.n_trs
+    assert out.shape == (st.n_trs, N_FEATURES)
 
 
 @pytest.mark.parametrize(
