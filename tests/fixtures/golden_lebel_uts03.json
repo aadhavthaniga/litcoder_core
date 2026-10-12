@@ -6,8 +6,8 @@
     "env_var": "LITCODER_LEBEL_ASSEMBLY"
   },
   "run": {
-    "date": "2026-09-17",
-    "commit": "a53ee0f9d989e218b98b528b69588c2ce5497273",
+    "date": "2026-10-12",
+    "commit": "ec31915a05daede3edfd31ae9966bec556e5c5a9",
     "script": "train_simple.py",
     "machine": "macOS, Apple Silicon, MPS (linalg_svd falls back to CPU)",
     "env": "conda env 'litcoder'",
@@ -153,5 +153,5 @@
     "command": "LITCODER_LEBEL_ASSEMBLY=/path/to/assembly_lebel_uts03.pkl python tests/test_golden_lebel.py --update",
     "when": "Run this only when a change to the pipeline is intended. It rewrites metrics, quantiles, threshold_counts, shapes and the environment fingerprint from a fresh run, and leaves tolerances and notes alone. Review the diff: a change you did not expect is the test doing its job."
   },
-  "notes": "Baseline generated locally rather than on PACE. An earlier run recorded on 2026-08 (median 0.043, 2853 significant voxels) is NOT comparable to this one and must not be used to justify a tolerance. That run predates commit 33e167b ('seed fold shuffling for reproducible splits'); before it, create_chunked_folds called bare random.shuffle() on the global unseeded RNG, so the inner-CV folds differed on every invocation and the fit was a different model each time. The gap between the two recorded numbers is therefore not evidence of environmental variance, and the August run is not reproducible by current code on any machine."
+  "notes": "Baseline generated locally rather than on PACE. An earlier run recorded on 2026-08 (median 0.043, 2853 significant voxels) is NOT comparable to this one and must not be used to justify a tolerance. That run predates the commit 'seed fold shuffling for reproducible splits'; before it, create_chunked_folds called bare random.shuffle() on the global unseeded RNG, so the inner-CV folds differed on every invocation and the fit was a different model each time. The gap between the two recorded numbers is therefore not evidence of environmental variance, and the August run is not reproducible by current code on any machine."
 }
