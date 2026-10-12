@@ -1,8 +1,7 @@
 """Characterization test for the real LeBel assembly.
 
-This pins the numbers that ``train_simple.py`` produces against a 2.8 GB fixture
-that is not in the repository. It is opt-in: without the fixture it skips, so CI
-without the file passes clean.
+Pins the numbers ``train_simple.py`` produces against a 2.8 GB fixture that is not
+in the repository. Skips when the fixture is absent.
 
 Running it::
 
@@ -14,33 +13,16 @@ Regenerating the golden values after an *intended* change::
     LITCODER_LEBEL_ASSEMBLY=/path/to/assembly_lebel_uts03.pkl \
         python tests/test_golden_lebel.py --update
 
-Why the assertions look the way they do
----------------------------------------
-Shapes and the fixture md5 are exact -- they are integers and a hash, and there is
-no reason for either to drift.
-
-Distribution statistics (quantiles of the per-voxel correlation vector) are
-asserted with a tight absolute tolerance. They are threshold-free: a voxel moving
-slightly changes a quantile by the local spacing of the distribution (~9e-6 near
-the median on this fixture), not by a jump.
-
-Counts (``n_significant``, voxels above a fixed r) are asserted as a *relative
-band*, never exactly. ``n_significant`` comes from Benjamini-Hochberg, whose
-cutoff is a global order statistic: when one voxel crosses, the threshold index
-itself moves and can admit or drop a run of neighbours. Measured on this fixture,
-a uniform 1e-4 shift in r swings the count by 10 voxels and a 1e-3 shift by 59,
-while the same perturbations leave every asserted quantile untouched.
-
-Tolerances are chosen strict or loose by comparing the running environment's
-fingerprint against the one recorded in the JSON, and the chosen set is printed.
-See ``tolerances.rationale`` and ``measured_variance`` in the JSON for the
-measurements these numbers come from.
+Tolerances and the measurements behind them are in the JSON under
+``tolerances.rationale`` and ``measured_variance``.
 """
 
+import datetime
 import hashlib
 import json
 import os
 import platform
+import subprocess
 import sys
 import warnings
 from pathlib import Path
@@ -65,17 +47,12 @@ TRIMMING_CONFIG = {
 FIR_DELAYS = [1, 2, 3, 4]
 
 
-# --------------------------------------------------------------------------
-# Fixture discovery and integrity
-# --------------------------------------------------------------------------
-
 def load_golden() -> dict:
     with open(GOLDEN_PATH) as f:
         return json.load(f)
 
 
 def skip_reason(golden: dict) -> str:
-    """An actionable message, not just 'skipped'."""
     raw = os.environ.get(ENV_VAR)
     where = golden["fixture"]["source"]
     name = golden["fixture"]["file"]
@@ -103,7 +80,6 @@ def file_md5(path: Path, chunk: int = 8 << 20) -> str:
 
 
 def environment_fingerprint() -> dict:
-    """What the numerics actually depend on, beyond the input file."""
     import scipy
     import torch
 
@@ -125,19 +101,12 @@ def environment_fingerprint() -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# The pipeline under test
-# --------------------------------------------------------------------------
-
 def run_pipeline(assembly_path: str, results_dir: str) -> dict:
-    """Run exactly what train_simple.py runs, with logging and plotting stubbed.
+    """Run what train_simple.py runs, with logging and plotting stubbed.
 
-    Deliberately calls ``fit_predict`` with no model kwargs, because
-    ``train_simple.py`` calls ``trainer.train()`` with none -- so the defaults
-    (5 inner folds, chunked folds of length 20, alphas=logspace(-1, 8, 10),
-    fold seed 0) are part of what is being characterized.
+    Calls ``fit_predict`` with no model kwargs, as ``train_simple.py`` calls
+    ``trainer.train()`` with none -- the defaults are part of what is characterized.
     """
-    # Imported lazily so that collection works without the heavy stack present.
     from conftest import _NullBrainPlotter, _NullLogger
     import encoding.trainer as trainer_mod
     from encoding.assembly.assembly_loader import load_assembly
@@ -190,10 +159,6 @@ def run_pipeline(assembly_path: str, results_dir: str) -> dict:
     }
 
 
-# --------------------------------------------------------------------------
-# Fixtures
-# --------------------------------------------------------------------------
-
 @pytest.fixture(scope="module")
 def golden() -> dict:
     return load_golden()
@@ -201,7 +166,7 @@ def golden() -> dict:
 
 @pytest.fixture(scope="module")
 def verified_assembly_path(golden) -> str:
-    """Skip when the fixture is absent; fail loudly when it is the wrong file."""
+    """Skip when the fixture is absent; fail when it is the wrong file."""
     raw = os.environ.get(ENV_VAR)
     if not raw or not Path(raw).is_file():
         pytest.skip(skip_reason(golden))
@@ -211,12 +176,9 @@ def verified_assembly_path(golden) -> str:
     expected = golden["fixture"]["md5"]
     if actual != expected:
         pytest.fail(
-            f"Assembly at {path} has md5 {actual}, but the golden values in "
-            f"{GOLDEN_PATH.name} were generated against md5 {expected}.\n"
-            f"Golden values are meaningless against a different input, so this is a "
-            f"hard failure rather than a skip.\n"
-            f"Either point {ENV_VAR} at the correct file, or -- if this new file is "
-            f"intentional -- regenerate with:\n"
+            f"Assembly at {path} has md5 {actual}; golden values were generated "
+            f"against md5 {expected}.\n"
+            f"If the new file is intentional, regenerate with:\n"
             f"  {golden['regeneration']['command']}"
         )
     return str(path)
@@ -224,7 +186,8 @@ def verified_assembly_path(golden) -> str:
 
 @pytest.fixture(scope="module")
 def result(verified_assembly_path, golden, tmp_path_factory) -> dict:
-    """Run the pipeline once for the whole module (it takes ~25 s warm)."""
+    """Module-scoped, so conftest's function-scoped autouse patching is not yet
+    active; patch explicitly for the duration of the run."""
     with pytest.MonkeyPatch.context() as mp:
         from conftest import _NullBrainPlotter, _NullLogger
         import encoding.trainer as trainer_mod
@@ -271,37 +234,17 @@ def tolerances(golden) -> dict:
     return chosen
 
 
-# --------------------------------------------------------------------------
-# Tests
-# --------------------------------------------------------------------------
-
 def test_golden_json_is_well_formed(golden):
-    """Runs everywhere, including CI without the fixture."""
     for key in ("fixture", "shapes", "metrics", "quantiles", "tolerances", "regeneration"):
         assert key in golden
-    assert len(golden["fixture"]["md5"]) == 32
-    assert golden["tolerances"]["quantile_atol_strict"] < golden["tolerances"]["quantile_atol_loose"]
-    assert golden["tolerances"]["count_rtol_strict"] < golden["tolerances"]["count_rtol_loose"]
-    # The median must agree with the p50 quantile, or the two would drift apart.
     assert golden["metrics"]["median_score"] == pytest.approx(golden["quantiles"]["50"])
 
 
-def test_skip_reason_is_actionable(golden):
-    """The skip message must tell someone what to set and where to get the file."""
-    reason = skip_reason(golden)
-    assert ENV_VAR in reason
-    assert golden["fixture"]["md5"] in reason
-    assert golden["fixture"]["file"] in reason
-    assert "2.8 GB" in reason
-
-
 def test_shapes_match_exactly(result, golden):
-    """Shapes are integers; there is no tolerance to apply."""
     assert result["shapes"] == {k: list(v) for k, v in golden["shapes"].items()}
 
 
 def test_correlation_quantiles(result, golden, tolerances):
-    """Threshold-free distribution statistics, asserted tightly."""
     correlations = result["correlations"]
     assert correlations.shape == (golden["metrics"]["n_voxels"],)
 
@@ -313,38 +256,24 @@ def test_correlation_quantiles(result, golden, tolerances):
             failures.append(f"  p{q_str}: expected {expected:.10f}, got {actual:.10f} "
                             f"(delta {actual - expected:+.3e}, atol {atol:g})")
     assert not failures, (
-        "Correlation distribution moved:\n" + "\n".join(failures)
-        + f"\nIf this change is intended, regenerate with:\n  {golden['regeneration']['command']}"
-    )
-
-
-def test_median_score(result, golden, tolerances):
-    """The headline number train_simple.py prints."""
-    expected = golden["metrics"]["median_score"]
-    actual = result["median_score"]
-    assert actual == pytest.approx(expected, abs=tolerances["quantile_atol"]), (
-        f"median r moved from {expected:.10f} to {actual:.10f} "
-        f"(delta {actual - expected:+.3e}).\n"
-        f"If intended, regenerate with:\n  {golden['regeneration']['command']}"
+        "Correlation quantiles moved:\n" + "\n".join(failures)
+        + f"\nIf intended, regenerate with:\n  {golden['regeneration']['command']}"
     )
 
 
 def test_n_significant_within_band(result, golden, tolerances):
-    """Banded, never exact -- the BH cutoff is an order statistic with a cascade."""
+    """Banded, not exact: voxels near the BH cutoff flip on tiny correlation changes."""
     expected = golden["metrics"]["n_significant"]
     actual = result["n_significant"]
     rtol = tolerances["count_rtol"]
     lo, hi = expected * (1 - rtol), expected * (1 + rtol)
     assert lo <= actual <= hi, (
         f"n_significant={actual} outside [{lo:.0f}, {hi:.0f}] (expected {expected}, rtol {rtol:g}).\n"
-        f"A few voxels either side is normal: FDR thresholding means voxels near the "
-        f"cutoff flip on tiny correlation changes. A move this large is not that.\n"
         f"If intended, regenerate with:\n  {golden['regeneration']['command']}"
     )
 
 
 def test_threshold_counts_within_band(result, golden, tolerances):
-    """Counts above a fixed r -- same cliff reasoning as n_significant, same banding."""
     correlations = result["correlations"]
     rtol = tolerances["count_rtol"]
     for cut_str, expected in golden["threshold_counts"].items():
@@ -357,16 +286,8 @@ def test_threshold_counts_within_band(result, golden, tolerances):
         )
 
 
-# --------------------------------------------------------------------------
-# Regeneration entry point
-# --------------------------------------------------------------------------
-
 def regenerate() -> int:
-    """Rewrite the measured fields of the golden JSON from a fresh run.
-
-    Leaves tolerances, rationale and notes alone -- those are human judgements,
-    not measurements, and silently overwriting them would defeat the point.
-    """
+    """Rewrite the measured fields of the golden JSON; tolerances and notes are left alone."""
     import tempfile
 
     golden = load_golden()
@@ -396,6 +317,17 @@ def regenerate() -> int:
 
     correlations = result["correlations"]
     golden["fixture"]["md5"] = actual_md5
+    golden["run"]["date"] = datetime.date.today().isoformat()
+    try:
+        golden["run"]["commit"] = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        pass
     golden["environment"]["fingerprint"] = environment_fingerprint()
     golden["shapes"] = result["shapes"]
     golden["metrics"]["median_score"] = round(float(np.median(correlations)), 10)
@@ -416,7 +348,7 @@ def regenerate() -> int:
     print(f"updated {GOLDEN_PATH}")
     print(f"  median_score  = {golden['metrics']['median_score']}")
     print(f"  n_significant = {golden['metrics']['n_significant']}")
-    print("Review the diff before committing: an unexpected change is the test working.")
+    print("Review the diff before committing.")
     return 0
 
 

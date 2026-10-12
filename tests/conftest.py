@@ -1,12 +1,8 @@
 """Shared fixtures for the synthetic end-to-end pipeline tests.
 
-The real LeBel assembly is ~3 GB and needs a GPU-ish machine to be useful. These
-tests instead build a small assembly with the *same structural conventions* and a
-signal planted at known FIR lags, so the whole extract -> downsample -> FIR ->
-trim -> ridge path can be checked for correctness in seconds.
-
-Conventions copied from ``data/assembly_lebel_uts03.pkl`` (verified against all 25
-stories of that file):
+Builds a small assembly with the same structural conventions as
+``data/assembly_lebel_uts03.pkl`` and a signal planted at known FIR lags.
+Conventions (verified against all 25 stories of that file):
 
 * ``len(split_indices) + 1 == len(tr_times)`` -- split_indices are *cut points*
   into the word axis, consumed by ``np.split``, not a per-word TR label.
@@ -20,7 +16,7 @@ import os
 
 # Must happen before anything imports matplotlib/wandb (encoding.trainer pulls in
 # encoding.plotting.plotting_utils, which imports matplotlib and nilearn at module
-# scope). Belt and braces with the monkeypatching in _no_external_side_effects.
+# scope).
 os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("WANDB_MODE", "disabled")
 os.environ.setdefault("WANDB_SILENT", "true")
@@ -28,7 +24,7 @@ os.environ.setdefault("WANDB_DISABLED", "true")
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pytest
@@ -38,18 +34,14 @@ from encoding.assembly.story_data import StoryData
 from encoding.features.base import BaseFeatureExtractor
 from encoding.features.embeddings import StaticEmbeddingFeatureExtractor
 
-# --------------------------------------------------------------------------
-# Constants mirroring the real LeBel assembly / train_simple.py
-# --------------------------------------------------------------------------
-
 N_VERTICES = 20484          # fsaverage5, both hemispheres
-N_FEATURES = 4              # synthetic embedding dimensionality
+N_FEATURES = 4
 N_SIGNAL_VERTICES = 10      # vertices 0..9 carry the planted signal
-PLANTED_LAGS = (2, 3)       # the "bump" in the planted FIR kernel
-FIR_DELAYS = [1, 2, 3, 4]   # delays the pipeline is run with
+PLANTED_LAGS = (2, 3)
+FIR_DELAYS = [1, 2, 3, 4]
 TR = 1.5
-BRAIN_TRIM_HEAD = 10        # TRs already removed from brain_data at the front
-BRAIN_TRIM_TAIL = 5         # ... and at the back
+BRAIN_TRIM_HEAD = 10
+BRAIN_TRIM_TAIL = 5
 BRAIN_TRIM_TOTAL = BRAIN_TRIM_HEAD + BRAIN_TRIM_TAIL
 
 # Same trimming used in train_simple.py for the LeBel dataset.
@@ -65,10 +57,6 @@ TRIMMING_CONFIG = {
 }
 
 
-# --------------------------------------------------------------------------
-# Deterministic token -> vector map (a stand-in for a static embedding model)
-# --------------------------------------------------------------------------
-
 def token_vector(token: str, dim: int = N_FEATURES) -> np.ndarray:
     """Map a token to a fixed pseudo-random vector.
 
@@ -81,16 +69,12 @@ def token_vector(token: str, dim: int = N_FEATURES) -> np.ndarray:
 
 
 class SyntheticTokenFeatureExtractor(StaticEmbeddingFeatureExtractor):
-    """Word-level feature extractor that plugs into the real factory dispatch.
+    """Word-level extractor that plugs into the real factory dispatch.
 
-    Subclasses ``StaticEmbeddingFeatureExtractor`` so that
-    ``FeatureExtractorFactory._get_modality_from_extractor`` reports "embeddings"
-    and the factory feeds it ``assembly.get_words()[idx]`` (one entry per word).
-    The parent ``__init__`` is deliberately bypassed: it requires a gensim vector
-    file on disk, which is exactly what we are replacing.
-
-    The class name must not contain "wordrate", or ``AbstractTrainer._should_downsample``
-    would skip downsampling for it.
+    Subclasses ``StaticEmbeddingFeatureExtractor`` so the factory feeds it
+    ``assembly.get_words()[idx]``; the parent ``__init__`` is bypassed because it
+    requires a gensim vector file. The class name must not contain "wordrate", or
+    ``AbstractTrainer._should_downsample`` would skip downsampling for it.
     """
 
     def __init__(self, dim: int = N_FEATURES):
@@ -103,17 +87,8 @@ class SyntheticTokenFeatureExtractor(StaticEmbeddingFeatureExtractor):
         return np.vstack([token_vector(tok, self.dim) for tok in stimuli])
 
 
-# --------------------------------------------------------------------------
-# Reference implementations -- deliberately independent of encoding/
-# --------------------------------------------------------------------------
-
 def reference_legacy_average(word_features: np.ndarray, counts: np.ndarray) -> np.ndarray:
-    """Average word features per TR, given the number of words in each TR.
-
-    Written from ``counts`` rather than from ``split_indices``/``np.split`` so it
-    is an independent oracle for LegacyAverageDownsampler rather than a restatement
-    of it. TRs with no words stay as zero rows, matching the library.
-    """
+    """Per-TR mean of word features, from counts rather than np.split; empty TRs stay zero."""
     out = np.zeros((len(counts), word_features.shape[1]))
     pos = 0
     for i, c in enumerate(counts):
@@ -129,44 +104,13 @@ def reference_make_delayed(features: np.ndarray, delays) -> np.ndarray:
     blocks = []
     for d in delays:
         block = np.zeros((n_t, n_d))
-        if d > 0:
-            block[d:] = features[:-d]
-        elif d == 0:
-            block = features.copy()
-        else:
-            block[:d] = features[-d:]
+        block[d:] = features[:-d]
         blocks.append(block)
     return np.hstack(blocks)
 
 
-def column_correlations(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Pearson r between matching columns of two (n_samples, n_targets) matrices."""
-    az = a - a.mean(axis=0)
-    bz = b - b.mean(axis=0)
-    denom = np.linalg.norm(az, axis=0) * np.linalg.norm(bz, axis=0)
-    out = np.zeros(a.shape[1])
-    nz = denom > 0
-    out[nz] = (az[:, nz] * bz[:, nz]).sum(axis=0) / denom[nz]
-    return out
-
-
-def ridge_fit_predict(X_train, Y_train, X_test, alpha: float = 100.0) -> np.ndarray:
-    """Plain closed-form ridge; a fast stand-in for NestedCVModel in ablations."""
-    n_feat = X_train.shape[1]
-    gram = X_train.T @ X_train + alpha * np.eye(n_feat)
-    weights = np.linalg.solve(gram, X_train.T @ Y_train)
-    return X_test @ weights
-
-
-# --------------------------------------------------------------------------
-# Ground truth bundled alongside the assembly
-# --------------------------------------------------------------------------
-
 @dataclass
 class StoryTruth:
-    """Everything a test needs to know about how one synthetic story was built."""
-
-    name: str
     n_trs: int
     n_words: int
     counts: np.ndarray                 # words per TR, length n_trs
@@ -177,20 +121,11 @@ class StoryTruth:
 
 @dataclass
 class GroundTruth:
-    """Ground truth for the whole synthetic assembly."""
-
     stories: Dict[str, StoryTruth] = field(default_factory=dict)
     lag_weights: Dict[int, np.ndarray] = field(default_factory=dict)  # lag -> (N_FEATURES, N_SIGNAL)
     signal_vertices: np.ndarray = field(default_factory=lambda: np.arange(N_SIGNAL_VERTICES))
     noise_vertices: np.ndarray = field(default_factory=lambda: np.arange(N_SIGNAL_VERTICES, N_VERTICES))
-    planted_lags: Tuple[int, ...] = PLANTED_LAGS
-    fir_delays: Tuple[int, ...] = tuple(FIR_DELAYS)
-    trimming_config: Dict = field(default_factory=lambda: dict(TRIMMING_CONFIG))
 
-
-# --------------------------------------------------------------------------
-# The fixture builder
-# --------------------------------------------------------------------------
 
 def synthetic_assembly(
     n_stories: int = 3,
@@ -205,33 +140,18 @@ def synthetic_assembly(
 ) -> SimpleNeuroidAssembly:
     """Build a small assembly with a signal planted at known FIR lags.
 
-    The returned object is a real ``SimpleNeuroidAssembly`` and can be handed to
-    ``AbstractTrainer`` anywhere the LeBel assembly would go. Ground truth is
-    attached as ``assembly.truth`` (a :class:`GroundTruth`).
-
-    How the signal is planted
-    -------------------------
-    Per story, word-level features ``W`` are averaged into TR-level features ``F``
-    using the legacy convention. Brain data is then
+    Ground truth is attached as ``assembly.truth``. Brain data for the first
+    ``n_signal_vertices`` is
 
         brain[j, v] = sum_{d in planted_lags} F[j + BRAIN_TRIM_HEAD - d] @ lag_weights[d][:, v]
 
-    for ``v`` in the first ``n_signal_vertices``, and pure noise elsewhere.
+    where ``F`` is the legacy-averaged TR-level features; other vertices are noise.
+    The ``+ BRAIN_TRIM_HEAD`` offset matches ``TRIMMING_CONFIG``: the trainer pairs
+    ``features[10:-5]`` with ``targets[0:]``, so brain row ``j`` is aligned with
+    feature row ``j + 10``, whose FIR block for delay ``d`` holds ``F[j + 10 - d]``.
 
-    The ``+ BRAIN_TRIM_HEAD`` offset is what makes the planting consistent with
-    ``TRIMMING_CONFIG``: the trainer pairs ``features[10:-5]`` with ``targets[0:]``,
-    so brain row ``j`` is aligned with feature row ``j + 10``, whose FIR block for
-    delay ``d`` holds ``F[j + 10 - d]``. Only *past* TRs are ever referenced, so the
-    construction is causal by design.
-
-    Args:
-        n_stories: Number of stories. The last one becomes the held-out test story.
-        n_trs: Per-story TR counts (cycled if shorter than ``n_stories``).
-        noise_ratio: Noise std as a fraction of each signal vertex's own std.
-            0.5 gives an achievable ceiling of r ~= 0.89.
-        max_words_per_tr: Words per TR are drawn uniformly from [0, this), so some
-            TRs are empty -- which is what exercises the zero-row path in the
-            legacy downsamplers.
+    ``noise_ratio`` is noise std as a fraction of each signal vertex's std; 0.5
+    gives a ceiling of r ~= 0.89.
     """
     if n_stories < 2:
         raise ValueError("need at least 2 stories for a train/test split")
@@ -239,8 +159,6 @@ def synthetic_assembly(
         raise ValueError("planted lags must be < BRAIN_TRIM_HEAD to stay in range")
 
     rng = np.random.default_rng(seed)
-
-    # One shared set of lag weights, so the planted kernel is identical across stories.
     lag_weights = {
         lag: rng.standard_normal((n_features, n_signal_vertices))
         for lag in planted_lags
@@ -250,7 +168,6 @@ def synthetic_assembly(
         lag_weights=lag_weights,
         signal_vertices=np.arange(n_signal_vertices),
         noise_vertices=np.arange(n_signal_vertices, n_vertices),
-        planted_lags=tuple(planted_lags),
     )
 
     story_data_list: List[StoryData] = []
@@ -260,24 +177,20 @@ def synthetic_assembly(
         name = f"synthstory{s}"
         n_tr = n_trs[s % len(n_trs)]
 
-        # --- word/TR bookkeeping, legacy split_indices convention -------------
         counts = story_rng.integers(0, max_words_per_tr, size=n_tr)
         # Mirror the real data: silence at the very start and end of a run.
         counts[:3] = 0
         counts[-2:] = 0
         n_words = int(counts.sum())
 
-        # Cut points into the word axis: cumsum minus the final total, giving
-        # exactly n_tr - 1 entries so that np.split yields n_tr chunks.
+        # n_tr - 1 cut points, so np.split yields n_tr chunks.
         split_indices = np.cumsum(counts)[:-1].astype(np.int64).tolist()
 
         words = [f"w{s}_{i}" for i in range(n_words)]
-        # Cumulative-context stimuli, one per word, as in the real assembly.
         stimuli = [" ".join(words[max(0, i - 5):i + 1]) for i in range(n_words)]
 
         tr_times = np.arange(n_tr, dtype=np.float64) * TR
 
-        # Word onsets spread inside their own TR, so data_times stays sorted.
         data_times = np.empty(n_words, dtype=np.float64)
         pos = 0
         for i, c in enumerate(counts):
@@ -289,7 +202,6 @@ def synthetic_assembly(
         word_features = np.vstack([token_vector(w, n_features) for w in words])
         tr_features = reference_legacy_average(word_features, counts)
 
-        # --- plant the FIR signal --------------------------------------------
         n_brain = n_tr - BRAIN_TRIM_TOTAL
         j = np.arange(n_brain)
         signal = np.zeros((n_brain, n_signal_vertices))
@@ -301,13 +213,11 @@ def synthetic_assembly(
         brain[:, :n_signal_vertices] = signal + story_rng.standard_normal(
             (n_brain, n_signal_vertices)
         ) * (signal_std * noise_ratio)
-        # Noise vertices get a comparable scale so nothing is separable by variance alone.
         brain[:, n_signal_vertices:] = story_rng.standard_normal(
             (n_brain, n_vertices - n_signal_vertices)
         ) * float(np.median(signal_std))
 
         truth.stories[name] = StoryTruth(
-            name=name,
             n_trs=n_tr,
             n_words=n_words,
             counts=counts,
@@ -337,22 +247,17 @@ def synthetic_assembly(
     return assembly
 
 
-# --------------------------------------------------------------------------
-# Fixtures
-# --------------------------------------------------------------------------
-
 class _NullLogger:
-    """Stand-in for WandBLogger/TensorBoardLogger that records calls in memory."""
+    """Stand-in for WandBLogger/TensorBoardLogger that records scalars in memory."""
 
     def __init__(self, *args, **kwargs):
         self.scalars: Dict[str, float] = {}
-        self.images: List[str] = []
 
     def log_scalar(self, name, value, step=None):
         self.scalars[name] = value
 
     def log_image(self, name, figure, step=None):
-        self.images.append(name)
+        pass
 
     def log_histogram(self, name, values, step=None):
         pass
@@ -387,7 +292,6 @@ def _no_external_side_effects(monkeypatch):
     monkeypatch.setattr(wandb, "log", lambda *a, **k: None, raising=False)
     monkeypatch.setattr(wandb, "finish", lambda *a, **k: None, raising=False)
 
-    # Last line of defence if a test reaches the real plotting utilities.
     import encoding.plotting.plotting_utils as plotting_utils
     monkeypatch.setattr(
         plotting_utils.datasets,
@@ -399,21 +303,9 @@ def _no_external_side_effects(monkeypatch):
 
 @pytest.fixture(scope="module")
 def assembly() -> SimpleNeuroidAssembly:
-    """The synthetic assembly, built once per test module."""
     return synthetic_assembly()
 
 
 @pytest.fixture(scope="module")
 def truth(assembly) -> GroundTruth:
     return assembly.truth
-
-
-@pytest.fixture
-def extractor() -> SyntheticTokenFeatureExtractor:
-    return SyntheticTokenFeatureExtractor()
-
-
-@pytest.fixture
-def downsample_config() -> Dict:
-    """legacy_average is the only averaging method that reads split_indices correctly."""
-    return {"method": "legacy_average"}
