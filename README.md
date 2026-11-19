@@ -206,6 +206,31 @@ in the recorded feature and sample order. Synthetic validation exercises
 the encoding path. Real-data loading/alignment and diagnostic replay do not
 establish independent predictive performance or exact paper replication.
 
+#### ECoG from the command line
+
+`unified.py` runs the same ECoG path. Put the `ecog_temporal_config` above in a
+JSON file, with one `feature_specs` entry per modality, in the same order:
+
+```json
+{"delays_s": [0, 0.1, 0.2], "protocol": "blocked", "embargo_s": 0.3,
+ "memory_budget_bytes": 2000000000,
+ "feature_specs": [{"method": "words_per_second", "support_s": [0, 0]},
+                   {"method": "word_sum", "support_s": [0, 0]}]}
+```
+
+```bash
+python unified.py --dataset_type ecog --data_dir path/to/ecog_dir --subject S1 \
+  --modalities wordrate embeddings --model_names wordrate word2vec \
+  --vector_path vectors.bin --binary --ecog_config ecog_config.json \
+  --cache_dir cache --n_outer_folds 5 --n_inner_folds 5 --alphas 0.1 1 10
+```
+
+`--data_dir` holds `ecog.json`. fMRI-only options (`--tr`, `--ndelays`, trimming,
+downsampling, `--folding_type`, `--chunk_length`) are rejected. For
+`diagnostic_in_sample`, omit `embargo_s` and the fold counts and pass one
+`--alphas` value. The saved results record the effective configuration and
+the config/manifest hashes under `metadata["run_config"]`.
+
 ## 3) Quick tutorial:
 
 This library uses the same core modules across datasets, here's an example for Narratives:

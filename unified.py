@@ -4,7 +4,11 @@ Unified trainer that works across datasets.
 """
 
 import argparse
+import hashlib
+import json
 import logging
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Union, Any, Optional
 import numpy as np
 from datetime import datetime
@@ -13,6 +17,7 @@ from encoding.assembly.assembly_generator import AssemblyGenerator
 from encoding.features.factory import FeatureExtractorFactory
 from encoding.downsample.downsampling import Downsampler
 from encoding.models.nested_cv import NestedCVModel
+from encoding.trainer import AbstractTrainer
 from encoding.utils import ActivationCache, ModelSaver, zs
 from encoding.features.FIR_expander import FIR
 from encoding.plotting.plotting_utils import (
@@ -434,18 +439,43 @@ class UnifiedTrainer:
             self.experiment_logger.log_scalar("n_significant_voxels", float(metrics["n_significant"]))
 
 
-def parse_args():
+# fMRI defaults are applied after parsing so ECoG can reject explicitly set
+# fMRI-only options. Effective fMRI values are unchanged.
+FMRI_DEFAULTS = {
+    "n_outer_folds": 5, "n_inner_folds": 5, "folding_type": "chunked",
+    "chunk_length": 20, "downsample_method": "lanczos",
+    "lanczos_cutoff_mult": 1.0, "lanczos_window": 3,
+}
+FMRI_REQUIRED = ("tr", "ndelays", "lookback")
+TRIMMING_PARAMS = (
+    "features_start", "features_end", "targets_start", "targets_end",
+    "train_features_start", "train_features_end", "train_targets_start", "train_targets_end",
+    "test_features_start", "test_features_end", "test_targets_start", "test_targets_end",
+)
+# Options with no meaning for continuous ECoG; timing comes from --ecog_config.
+ECOG_REJECTED = (
+    "tr", "ndelays", "story_idx", "story_order", "folding_type", "chunk_length",
+    "downsample_method", "lanczos_cutoff_mult", "lanczos_window", *TRIMMING_PARAMS,
+)
+
+
+def parse_args(argv=None):
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Unified trainer for encoding models")
 
     # Dataset parameters
     parser.add_argument("--dataset_type", type=str, required=True, 
-                       choices=["lpp", "lebel", "narratives"], 
+                       choices=["lpp", "lebel", "narratives", "ecog"],
                        help="Dataset type")
     parser.add_argument("--data_dir", type=str, required=True, 
-                       help="Path to dataset directory")
+                       help="Path to dataset directory (ECoG: directory with ecog.json, or the manifest)")
     parser.add_argument("--subject", type=str, required=True, help="Subject ID")
-    parser.add_argument("--tr", type=float, required=True, help="TR value")
+    parser.add_argument("--tr", type=float, help="TR value (required for fMRI)")
+    parser.add_argument("--ecog_config", type=str,
+                       help="ECoG only: JSON file with the temporal config (delays_s, feature_specs, "
+                            "protocol, embargo_s, memory_budget_bytes, retrospective)")
+    parser.add_argument("--alphas", type=float, nargs="+",
+                       help="ECoG only: ridge alphas (exactly one for diagnostic_in_sample)")
     parser.add_argument("--context_type", type=str, default="fullcontext",
                        choices=["fullcontext", "nocontext", "halfcontext"],
                        help="Context window type")
@@ -465,20 +495,20 @@ def parse_args():
     parser.add_argument("--last_token", action="store_true", help="Use last token only")
 
     # Training parameters
-    parser.add_argument("--n_outer_folds", type=int, default=5, help="Outer CV folds")
-    parser.add_argument("--n_inner_folds", type=int, default=5, help="Inner CV folds")
-    parser.add_argument("--folding_type", type=str, default="chunked", help="CV folding type")
-    parser.add_argument("--chunk_length", type=int, default=20, help="Chunk length")
+    parser.add_argument("--n_outer_folds", type=int, help="Outer CV folds (fMRI default 5)")
+    parser.add_argument("--n_inner_folds", type=int, help="Inner CV folds (fMRI default 5)")
+    parser.add_argument("--folding_type", type=str, help="CV folding type (fMRI only, default chunked)")
+    parser.add_argument("--chunk_length", type=int, help="Chunk length (fMRI only, default 20)")
     parser.add_argument("--singcutoff", type=float, default=1e-10, help="Singular value cutoff")
 
     # Preprocessing parameters
-    parser.add_argument("--downsample_method", type=str, default="lanczos", help="Downsampling method")
-    parser.add_argument("--lanczos_cutoff_mult", type=float, default=1.0, help="Lanczos cutoff multiplier")
-    parser.add_argument("--lanczos_window", type=int, default=3, help="Lanczos window")
+    parser.add_argument("--downsample_method", type=str, help="Downsampling method (fMRI only, default lanczos)")
+    parser.add_argument("--lanczos_cutoff_mult", type=float, help="Lanczos cutoff multiplier (fMRI only, default 1.0)")
+    parser.add_argument("--lanczos_window", type=int, help="Lanczos window (fMRI only, default 3)")
     parser.add_argument("--normalize_features", action="store_true", help="Normalize features")
     parser.add_argument("--normalize_targets", action="store_true", help="Normalize targets")
-    parser.add_argument("--ndelays", type=int, required=True, help="Number of FIR delays")
-    parser.add_argument("--lookback", type=int, required=True, help="Context lookback")
+    parser.add_argument("--ndelays", type=int, help="Number of FIR delays (required for fMRI)")
+    parser.add_argument("--lookback", type=int, help="Context lookback (required for fMRI; ECoG default 256)")
 
     # System parameters
     parser.add_argument("--use_gpu", action="store_true", help="Use GPU")
@@ -513,12 +543,115 @@ def parse_args():
     parser.add_argument("--test_targets_start", type=int, help="Test targets trim start")
     parser.add_argument("--test_targets_end", type=int, help="Test targets trim end")
 
-    return parser.parse_args()
+    args = parser.parse_args(argv)
+    if args.dataset_type == "ecog":
+        if not args.ecog_config:
+            parser.error("--dataset_type ecog requires --ecog_config")
+        rejected = [name for name in ECOG_REJECTED if getattr(args, name) is not None]
+        rejected += ["use_volume"] if args.use_volume else []
+        if rejected:
+            parser.error("fMRI-only options are not valid for --dataset_type ecog: "
+                         + ", ".join(f"--{name}" for name in rejected))
+        if args.lookback is None:
+            args.lookback = 256  # AbstractTrainer default
+    else:
+        for name in ("ecog_config", "alphas"):
+            if getattr(args, name) is not None:
+                parser.error(f"--{name} is only valid for --dataset_type ecog")
+            delattr(args, name)  # keep the saved fMRI config/run hash unchanged
+        missing = [f"--{name}" for name in FMRI_REQUIRED if getattr(args, name) is None]
+        if missing:
+            parser.error("the following arguments are required: " + ", ".join(missing))
+        for name, value in FMRI_DEFAULTS.items():
+            if getattr(args, name) is None:
+                setattr(args, name, value)
+    return args
 
 
-def main():
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def run_ecog(config: Dict) -> AbstractTrainer:
+    """Run continuous ECoG through the existing ECoG Python API.
+
+    The assembly comes from the ECoG manifest loader and preparation/CV come from
+    AbstractTrainer's ECoG branch; no fMRI downsampling, FIR or trimming is used.
+    """
+    config_path = Path(config["ecog_config"])
+    temporal = json.loads(config_path.read_text())
+    if not isinstance(temporal, dict):
+        raise ValueError("--ecog_config must contain a JSON object")
+
+    assembly = AssemblyGenerator.generate_assembly(
+        dataset_type="ecog",
+        data_dir=config["data_dir"],
+        subject=config["subject"],
+        lookback=config["lookback"],
+        context_type=config["context_type"],
+    )
+
+    # Reuse the fMRI CLI's extractor/model construction unchanged: setup_models
+    # only reads .config/.logger and sets .feature_extractors/.downsampler/.model.
+    # The Downsampler it creates is not passed on; ECoG alignment uses feature_specs.
+    components = SimpleNamespace(config=config, logger=logger)
+    UnifiedTrainer.setup_models(components)
+
+    fit_options = {name: config[name] for name in ("n_outer_folds", "n_inner_folds", "alphas")
+                   if config[name] is not None}
+    fit_options.update(
+        singcutoff=config["singcutoff"], use_gpu=config["use_gpu"],
+        single_alpha=True, normalpha=True, use_corr=True,
+        normalize_features=config["normalize_features"],
+        normalize_targets=config["normalize_targets"],
+    )
+
+    # Reproducibility record: the full temporal config and content hashes,
+    # with file names rather than absolute paths.
+    data_path = Path(config["data_dir"])
+    manifest = data_path / "ecog.json" if data_path.is_dir() else data_path
+    paths = {"data_dir", "ecog_config", "vector_path", "cache_dir", "results_dir"}
+    run_config = {key: value for key, value in config.items()
+                  if key not in paths and value is not None}
+    run_config.update(
+        entrypoint="unified.py",
+        encoding_model=components.model.model_name,
+        fit_options=fit_options,
+        ecog_temporal_config=temporal,
+        ecog_config_file=config_path.name,
+        ecog_config_sha256=_sha256(config_path),
+        manifest_file=manifest.name,
+        manifest_sha256=_sha256(manifest),
+    )
+    if config.get("vector_path"):
+        run_config["vector_file"] = Path(config["vector_path"]).name
+
+    trainer = AbstractTrainer(
+        assembly=assembly,
+        feature_extractors=components.feature_extractors,
+        downsampler=None,
+        model=components.model,
+        fir_delays=None,
+        trimming_config={},
+        use_train_test_split=False,
+        layer_idx=config["layer_idx"],
+        lookback=config["lookback"],
+        dataset_type="ecog",
+        logger_backend=config["logger_backend"],
+        wandb_project_name=config["wandb_project_name"],
+        results_dir=config["results_dir"],
+        run_name=f"ecog-{config['subject']}-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+        result_metadata={"run_config": run_config},
+        ecog_temporal_config=temporal,
+    )
+    trainer.train(**fit_options)
+    logger.info(f"Results saved to {trainer.last_run_dir_}")
+    return trainer
+
+
+def main(argv=None):
     """Main training function."""
-    args = parse_args()
+    args = parse_args(argv)
     config = vars(args)
     
     if not config.get("modalities") and not config.get("modality"):
@@ -530,6 +663,9 @@ def main():
         config["modalities"] = [config["modality"]]
     if config.get("model_name") and not config.get("model_names"):
         config["model_names"] = [config["model_name"]]
+
+    if config["dataset_type"] == "ecog":
+        return run_ecog(config)
     
     custom_trimming = {}
     trimming_params = [
